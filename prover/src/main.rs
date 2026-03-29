@@ -21,21 +21,18 @@ use tracing::info;
 use tlsn::{
     attestation::{
         request::{Request as AttestationRequest, RequestConfig},
-        signing::Secp256k1Signer,
-        Attestation, AttestationConfig, CryptoProvider, Secrets,
+        Attestation, CryptoProvider, Secrets,
     },
     config::{
         prove::ProveConfig,
         prover::ProverConfig,
         tls::TlsClientConfig,
         tls_commit::{mpc::MpcTlsConfig, TlsCommitConfig},
-        verifier::VerifierConfig,
     },
-    connection::{ConnectionInfo, HandshakeData, ServerName, TranscriptLength},
+    connection::{HandshakeData, ServerName},
     prover::ProverOutput,
-    transcript::{ContentType, TranscriptCommitConfig},
-    verifier::VerifierOutput,
-    webpki::{CertificateDer, RootCertStore},
+    transcript::TranscriptCommitConfig,
+    webpki::RootCertStore,
     Session,
 };
 use tlsn_formats::http::{DefaultHttpCommitter, HttpCommit, HttpTranscript};
@@ -50,6 +47,9 @@ const MAX_RECV_DATA: usize = 1 << 12; // 4KB received
 
 /// User agent to use for requests
 const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
+/// Binance recvWindow in milliseconds (max 60000)
+const BINANCE_RECV_WINDOW_MS: u64 = 60_000;
 
 #[derive(Parser, Debug)]
 #[command(name = "binance-pnl-prover")]
@@ -74,6 +74,14 @@ struct Args {
     /// Test mode - just fetch from Binance without notarization
     #[arg(long)]
     test: bool,
+
+    /// Notary host (trusted third-party or self-hosted notary)
+    #[arg(long, env = "NOTARY_HOST", default_value = "127.0.0.1")]
+    notary_host: String,
+
+    /// Notary port
+    #[arg(long, env = "NOTARY_PORT", default_value_t = 7047)]
+    notary_port: u16,
 }
 
 type HmacSha256 = Hmac<Sha256>;
@@ -90,6 +98,41 @@ fn get_timestamp() -> u64 {
         .duration_since(UNIX_EPOCH)
         .expect("Time went backwards")
         .as_millis() as u64
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BinanceServerTimeResponse {
+    server_time: u64,
+}
+
+async fn get_binance_server_timestamp() -> Result<u64> {
+    let client = reqwest::Client::new();
+    let response = client
+        .get(format!("https://{}/api/v3/time", BINANCE_HOST))
+        .send()
+        .await
+        .context("Failed to fetch Binance server time")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<unavailable>".to_string());
+        anyhow::bail!(
+            "Failed to fetch Binance server time: {} - {}",
+            status,
+            body
+        );
+    }
+
+    let payload: BinanceServerTimeResponse = response
+        .json()
+        .await
+        .context("Failed to parse Binance server time response")?;
+
+    Ok(payload.server_time)
 }
 
 #[tokio::main]
@@ -124,16 +167,38 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Create duplex channel for prover-verifier communication (local notary)
-    let (prover_socket, notary_socket) = tokio::io::duplex(1 << 23);
+    info!(
+        "Connecting to notary at {}:{}...",
+        args.notary_host, args.notary_port
+    );
+    let notary_socket = match tokio::net::TcpStream::connect((args.notary_host.as_str(), args.notary_port)).await {
+        Ok(socket) => socket,
+        Err(err) => {
+            let mut message = format!(
+                "Failed to connect to notary at {}:{}",
+                args.notary_host, args.notary_port
+            );
+            if args.notary_host == "notary.pse.dev" {
+                message.push_str(
+                    "\n\nThe public endpoint at notary.pse.dev was sunset by PSE and may be unavailable.\nRun a trusted self-hosted notary and set NOTARY_HOST/NOTARY_PORT (or pass --notary-host/--notary-port).",
+                );
+            } else {
+                message.push_str(
+                    "\n\nEnsure your trusted notary service is running and reachable, then retry with --notary-host/--notary-port.",
+                );
+            }
+            return Err(anyhow::Error::new(err).context(message));
+        }
+    };
 
-    // Run the prover and notary concurrently
-    let (prover_result, _notary_result) = tokio::try_join!(
-        run_prover(prover_socket, &api_key, &secret_key, &args.symbol, args.limit),
-        run_notary(notary_socket)
-    )?;
-
-    let (attestation, secrets) = prover_result;
+    let (attestation, secrets) = run_prover(
+        notary_socket,
+        &api_key,
+        &secret_key,
+        &args.symbol,
+        args.limit,
+    )
+    .await?;
 
     // Save attestation and secrets to disk
     tokio::fs::write(&args.attestation_output, bincode::serialize(&attestation)?).await?;
@@ -147,14 +212,20 @@ async fn main() -> Result<()> {
     println!("     cargo run -p binance-pnl-prover -- present");
     println!("  2. Share the presentation with verifiers");
     println!("  3. Verifiers can run: cargo run -p binance-pnl-verifier presentation.tlsn");
+    println!("\nNote: Ensure your verifier trusts the notary public key for {}:{}", args.notary_host, args.notary_port);
 
     Ok(())
 }
 
 /// Test mode - just fetch from Binance without notarization
 async fn test_binance_api(api_key: &str, secret_key: &str, symbol: &str, limit: u32) -> Result<()> {
-    let timestamp = get_timestamp();
-    let query_without_sig = format!("symbol={}&timestamp={}&limit={}", symbol, timestamp, limit);
+    let timestamp = get_binance_server_timestamp()
+        .await
+        .unwrap_or_else(|_| get_timestamp());
+    let query_without_sig = format!(
+        "symbol={}&timestamp={}&recvWindow={}&limit={}",
+        symbol, timestamp, BINANCE_RECV_WINDOW_MS, limit
+    );
     let signature = sign_request(&query_without_sig, secret_key);
     let full_query = format!("{}&signature={}", query_without_sig, signature);
     
@@ -213,8 +284,13 @@ async fn run_prover<S: AsyncWrite + AsyncRead + Send + Sync + Unpin + 'static>(
     limit: u32,
 ) -> Result<(Attestation, Secrets)> {
     // Build the request parameters
-    let timestamp = get_timestamp();
-    let query_without_sig = format!("symbol={}&timestamp={}&limit={}", symbol, timestamp, limit);
+    let timestamp = get_binance_server_timestamp()
+        .await
+        .unwrap_or_else(|_| get_timestamp());
+    let query_without_sig = format!(
+        "symbol={}&timestamp={}&recvWindow={}&limit={}",
+        symbol, timestamp, BINANCE_RECV_WINDOW_MS, limit
+    );
     let signature = sign_request(&query_without_sig, secret_key);
     let full_query = format!("{}&signature={}", query_without_sig, signature);
     let uri = format!("/api/v3/myTrades?{}", full_query);
@@ -419,116 +495,3 @@ async fn run_prover<S: AsyncWrite + AsyncRead + Send + Sync + Unpin + 'static>(
     Ok((attestation, secrets))
 }
 
-async fn run_notary<S: AsyncWrite + AsyncRead + Send + Sync + Unpin + 'static>(
-    socket: S,
-) -> Result<()> {
-    info!("Starting local notary...");
-
-    // Create session with prover
-    let session = Session::new(socket.compat());
-    let (driver, mut handle) = session.split();
-
-    // Spawn session driver
-    let driver_task = tokio::spawn(driver);
-
-    // Build root certificate store from Mozilla roots
-    let root_store = RootCertStore::mozilla();
-
-    // Create verifier (acts as notary)
-    let verifier_config = VerifierConfig::builder().root_store(root_store).build()?;
-
-    let verifier = handle
-        .new_verifier(verifier_config)?
-        .commit()
-        .await?
-        .accept()
-        .await?
-        .run()
-        .await?;
-
-    let (
-        VerifierOutput {
-            transcript_commitments,
-            ..
-        },
-        verifier,
-    ) = verifier.verify().await?.accept().await?;
-
-    let tls_transcript = verifier.tls_transcript().clone();
-    verifier.close().await?;
-
-    // Calculate transcript lengths
-    let sent_len = tls_transcript
-        .sent()
-        .iter()
-        .filter_map(|record| {
-            if let ContentType::ApplicationData = record.typ {
-                Some(record.ciphertext.len())
-            } else {
-                None
-            }
-        })
-        .sum::<usize>();
-
-    let recv_len = tls_transcript
-        .recv()
-        .iter()
-        .filter_map(|record| {
-            if let ContentType::ApplicationData = record.typ {
-                Some(record.ciphertext.len())
-            } else {
-                None
-            }
-        })
-        .sum::<usize>();
-
-    // Close session and reclaim socket
-    handle.close();
-    let mut socket = driver_task.await??;
-
-    // Receive attestation request
-    let mut request_bytes = Vec::new();
-    socket.read_to_end(&mut request_bytes).await?;
-    let request: AttestationRequest = bincode::deserialize(&request_bytes)?;
-
-    // Create signing key (in production, use a real key)
-    let signing_key = k256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
-    let signer = Box::new(Secp256k1Signer::new(&signing_key.to_bytes())?);
-    let mut provider = CryptoProvider::default();
-    provider.signer.set_signer(signer);
-
-    // Log the public key for verification
-    let verifying_key = signing_key.verifying_key();
-    let pubkey_bytes = verifying_key.to_sec1_bytes();
-    info!("Notary public key: {}", hex::encode(&pubkey_bytes));
-
-    // Build attestation config
-    let mut att_config_builder = AttestationConfig::builder();
-    att_config_builder.supported_signature_algs(Vec::from_iter(provider.signer.supported_algs()));
-    let att_config = att_config_builder.build()?;
-
-    // Build attestation
-    let mut builder = Attestation::builder(&att_config).accept_request(request)?;
-    builder
-        .connection_info(ConnectionInfo {
-            time: tls_transcript.time(),
-            version: *tls_transcript.version(),
-            transcript_length: TranscriptLength {
-                sent: sent_len as u32,
-                received: recv_len as u32,
-            },
-        })
-        .server_ephemeral_key(tls_transcript.server_ephemeral_key().clone())
-        .transcript_commitments(transcript_commitments);
-
-    let attestation = builder.build(&provider)?;
-
-    // Send attestation to prover
-    let attestation_bytes = bincode::serialize(&attestation)?;
-    socket.write_all(&attestation_bytes).await?;
-    socket.close().await?;
-
-    info!("Notarization complete!");
-
-    Ok(())
-}

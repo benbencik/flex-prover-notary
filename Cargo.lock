@@ -369,6 +369,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "binance-pnl-notary"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "clap",
+ "futures",
+ "hex",
+ "k256",
+ "tlsn",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "binance-pnl-prover"
 version = "0.1.0"
 dependencies = [

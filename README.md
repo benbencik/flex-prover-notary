@@ -54,10 +54,29 @@ cp .env.example .env
 
 **Important:** Only enable "Read Info" permission on your API key. Do NOT enable trading!
 
-### 2. Generate Proof
+### 2. Start a Trusted Notary
+
+Start the bundled notary service (terminal 1):
 
 ```bash
-# Fetch trades and generate attestation
+cargo run -p binance-pnl-notary
+```
+
+On first run it creates `notary.signing_key.hex` and prints the notary public key.
+Keep this key file stable across restarts so verifiers can trust a consistent identity.
+
+Then configure prover connection:
+
+```bash
+# .env
+NOTARY_HOST=127.0.0.1
+NOTARY_PORT=7047
+```
+
+### 3. Generate Proof
+
+```bash
+# Fetch trades and generate attestation (uses NOTARY_HOST/NOTARY_PORT)
 cargo run -p binance-pnl-prover -- --symbol BTCUSDT --limit 100
 ```
 
@@ -65,7 +84,7 @@ This creates:
 - `attestation.tlsn` - The notarized attestation
 - `secrets.tlsn` - Your private keys for creating presentations
 
-### 3. Create Presentation (Selective Disclosure)
+### 4. Create Presentation (Selective Disclosure)
 
 ```bash
 # Create a shareable presentation with redacted credentials
@@ -75,7 +94,7 @@ cargo run -p binance-pnl-prover --bin present
 This creates:
 - `presentation.tlsn` - Shareable proof with API key redacted
 
-### 4. Verify Proof
+### 5. Verify Proof
 
 ```bash
 # Anyone can verify the presentation
@@ -119,7 +138,7 @@ Net PnL:          $    +419.50 USDT ✓
 │                                     │                       │
 │                              ┌──────▼──────┐               │
 │                              │   Notary    │               │
-│                              │  (Local)    │               │
+│                              │ (Trusted)   │               │
 │                              └──────┬──────┘               │
 │                                     │                       │
 │                              ┌──────▼──────┐               │
@@ -164,7 +183,20 @@ Options:
   -l, --limit <LIMIT>                Number of trades [default: 100]
   -a, --attestation-output <FILE>    Output attestation [default: attestation.tlsn]
   -k, --secrets-output <FILE>        Output secrets [default: secrets.tlsn]
+      --notary-host <HOST>           Notary host [default: 127.0.0.1]
+      --notary-port <PORT>           Notary port [default: 7047]
 ```
+
+    ### Notary
+
+    ```
+    cargo run -p binance-pnl-notary -- [OPTIONS]
+
+    Options:
+      --bind-host <HOST>                Bind host [default: 127.0.0.1]
+      --bind-port <PORT>                Bind port [default: 7047]
+      --signing-key-file <FILE>         Signing key file [default: notary.signing_key.hex]
+    ```
 
 ### Presenter
 
@@ -193,15 +225,17 @@ Options:
 
 1. **API Key Safety**: Your API key is used to make the request but is redacted from the proof. The verifier never sees it.
 
-2. **Local Notary**: This prototype uses a local notary. For production, use a trusted third-party notary like PSE's hosted service at `notary.pse.dev`.
+2. **Trusted Notary**: This prover connects to an external notary (`--notary-host`, `--notary-port`). Verifiers should only trust attestations signed by known, pinned notary keys.
 
-3. **Key Permissions**: Only grant "Read Info" permissions to your API key. Never enable trading or withdrawal permissions for keys used with third-party tools.
+3. **Hosted Notary Availability**: PSE sunset the public `notary.pse.dev` endpoint in March 2026. Run your own trusted notary service and configure `NOTARY_HOST`/`NOTARY_PORT`.
 
-4. **Signature Redaction**: The HMAC signature in the request URL is derived from your secret key. It's also redacted in the presentation.
+4. **Key Permissions**: Only grant "Read Info" permissions to your API key. Never enable trading or withdrawal permissions for keys used with third-party tools.
+
+5. **Signature Redaction**: The HMAC signature in the request URL is derived from your secret key. It's also redacted in the presentation.
 
 ## Limitations
 
-- Currently uses a local notary (for development). Production use requires a trusted external notary.
+- Requires a reachable, trusted notary service.
 - TLSNotary only supports TLS 1.2 (Binance supports this).
 - Response size limited to ~16KB (configurable).
 
