@@ -41,9 +41,9 @@ use tlsn_formats::http::{DefaultHttpCommitter, HttpCommit, HttpTranscript};
 const BINANCE_HOST: &str = "api.binance.com";
 const BINANCE_PORT: u16 = 443;
 
-// TLSNotary settings - minimal limits for faster MPC
+// TLSNotary settings
 const MAX_SENT_DATA: usize = 1 << 10; // 1KB sent
-const MAX_RECV_DATA: usize = 1 << 12; // 4KB received
+const MAX_RECV_DATA: usize = 1 << 15; // 32KB received (enough for account balances or many trades)
 
 /// User agent to use for requests
 const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
@@ -51,11 +51,21 @@ const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KH
 /// Binance recvWindow in milliseconds (max 60000)
 const BINANCE_RECV_WINDOW_MS: u64 = 60_000;
 
+/// Which Binance API endpoint to notarise.
+#[derive(clap::ValueEnum, Debug, Clone, Default)]
+enum Endpoint {
+    /// Trade history for a symbol (`/api/v3/myTrades`).
+    #[default]
+    Trades,
+    /// Full account snapshot including all asset balances (`/api/v3/account`).
+    Account,
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "binance-pnl-prover")]
 #[command(about = "Generate a TLSNotary proof of your Binance trading PnL")]
 struct Args {
-    /// Trading pair symbol (e.g., BTCUSDT)
+    /// Trading pair symbol (e.g., BTCUSDT) — only used for the `trades` endpoint
     #[arg(short, long, default_value = "BTCUSDT")]
     symbol: String,
 
@@ -67,9 +77,21 @@ struct Args {
     #[arg(short = 'k', long, default_value = "secrets.tlsn")]
     secrets_output: String,
 
-    /// Number of trades to fetch (max 1000)
+    /// Number of trades to fetch (max 1000) — only used for the `trades` endpoint
     #[arg(short, long, default_value = "10")]
     limit: u32,
+
+    /// Only include trades on or after this date (YYYY-MM-DD, UTC) — `trades` endpoint only
+    #[arg(long)]
+    start_time: Option<String>,
+
+    /// Only include trades on or before this date (YYYY-MM-DD, UTC) — `trades` endpoint only
+    #[arg(long)]
+    end_time: Option<String>,
+
+    /// Binance API endpoint to notarise
+    #[arg(long, value_enum, default_value_t = Endpoint::Trades)]
+    endpoint: Endpoint,
 
     /// Test mode - just fetch from Binance without notarization
     #[arg(long)]
@@ -98,6 +120,15 @@ fn get_timestamp() -> u64 {
         .duration_since(UNIX_EPOCH)
         .expect("Time went backwards")
         .as_millis() as u64
+}
+
+/// Parse a YYYY-MM-DD date string (UTC midnight) to a Unix millisecond timestamp.
+fn parse_date_to_ms(date_str: &str) -> Result<u64> {
+    let date = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
+        .with_context(|| format!("Invalid date '{}' – expected YYYY-MM-DD", date_str))?;
+    let midnight = chrono::NaiveTime::from_hms_opt(0, 0, 0).expect("midnight is always valid");
+    let dt = date.and_time(midnight).and_utc();
+    Ok(dt.timestamp_millis() as u64)
 }
 
 #[derive(serde::Deserialize)]
@@ -157,13 +188,24 @@ async fn main() -> Result<()> {
     let secret_key = std::env::var("BINANCE_SECRET_KEY")
         .context("BINANCE_SECRET_KEY not set. Please add it to .env file")?;
 
-    info!("Starting Binance PnL prover for {}", args.symbol);
-    info!("Fetching up to {} trades", args.limit);
+    info!("Starting Binance PnL prover");
+
+    // Parse optional time range
+    let start_ms = args
+        .start_time
+        .as_deref()
+        .map(parse_date_to_ms)
+        .transpose()?;
+    let end_ms = args
+        .end_time
+        .as_deref()
+        .map(parse_date_to_ms)
+        .transpose()?;
 
     // Test mode - just fetch from Binance to verify API works
     if args.test {
         info!("Running in test mode (no notarization)...");
-        test_binance_api(&api_key, &secret_key, &args.symbol, args.limit).await?;
+        test_binance_api(&api_key, &secret_key, &args.endpoint, &args.symbol, args.limit, start_ms, end_ms).await?;
         return Ok(());
     }
 
@@ -195,8 +237,11 @@ async fn main() -> Result<()> {
         notary_socket,
         &api_key,
         &secret_key,
+        &args.endpoint,
         &args.symbol,
         args.limit,
+        start_ms,
+        end_ms,
     )
     .await?;
 
@@ -218,61 +263,147 @@ async fn main() -> Result<()> {
 }
 
 /// Test mode - just fetch from Binance without notarization
-async fn test_binance_api(api_key: &str, secret_key: &str, symbol: &str, limit: u32) -> Result<()> {
+async fn test_binance_api(
+    api_key: &str,
+    secret_key: &str,
+    endpoint: &Endpoint,
+    symbol: &str,
+    limit: u32,
+    start_ms: Option<u64>,
+    end_ms: Option<u64>,
+) -> Result<()> {
     let timestamp = get_binance_server_timestamp()
         .await
         .unwrap_or_else(|_| get_timestamp());
-    let query_without_sig = format!(
-        "symbol={}&timestamp={}&recvWindow={}&limit={}",
-        symbol, timestamp, BINANCE_RECV_WINDOW_MS, limit
-    );
-    let signature = sign_request(&query_without_sig, secret_key);
-    let full_query = format!("{}&signature={}", query_without_sig, signature);
-    
-    let url = format!("https://{}/api/v3/myTrades?{}", BINANCE_HOST, full_query);
-    
-    info!("Fetching from Binance...");
-    
+
     let client = reqwest::Client::new();
-    let response = client
-        .get(&url)
-        .header("X-MBX-APIKEY", api_key)
-        .send()
-        .await?;
-    
-    let status = response.status();
-    let body = response.text().await?;
-    
-    if !status.is_success() {
-        anyhow::bail!("Binance API error: {} - {}", status, body);
-    }
-    
-    let trades: Vec<serde_json::Value> = serde_json::from_str(&body)?;
-    
-    println!("\n=== Binance API Test Successful ===");
-    println!("Received {} trades for {}", trades.len(), symbol);
-    
-    if !trades.is_empty() {
-        let mut total_bought: f64 = 0.0;
-        let mut total_sold: f64 = 0.0;
-        
-        for trade in &trades {
-            let quote_qty: f64 = trade["quoteQty"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
-            let is_buyer = trade["isBuyer"].as_bool().unwrap_or(false);
-            if is_buyer {
-                total_bought += quote_qty;
-            } else {
-                total_sold += quote_qty;
+
+    match endpoint {
+        Endpoint::Trades => {
+            let mut query = format!(
+                "symbol={}&timestamp={}&recvWindow={}&limit={}",
+                symbol, timestamp, BINANCE_RECV_WINDOW_MS, limit
+            );
+            if let Some(start) = start_ms {
+                query.push_str(&format!("&startTime={}", start));
             }
+            if let Some(end) = end_ms {
+                query.push_str(&format!("&endTime={}", end));
+            }
+            let signature = sign_request(&query, secret_key);
+            let url = format!(
+                "https://{}/api/v3/myTrades?{}&signature={}",
+                BINANCE_HOST, query, signature
+            );
+
+            info!("Fetching trades from Binance...");
+
+            let response = client
+                .get(&url)
+                .header("X-MBX-APIKEY", api_key)
+                .send()
+                .await?;
+            let status = response.status();
+            let body = response.text().await?;
+
+            if !status.is_success() {
+                anyhow::bail!("Binance API error: {} - {}", status, body);
+            }
+
+            let trades: Vec<serde_json::Value> = serde_json::from_str(&body)?;
+
+            println!("\n=== Binance API Test Successful (trades) ===");
+            println!("Received {} trades for {}", trades.len(), symbol);
+
+            if !trades.is_empty() {
+                let mut total_bought: f64 = 0.0;
+                let mut total_sold: f64 = 0.0;
+                let mut total_commission: f64 = 0.0;
+                let mut buy_count = 0u32;
+                let mut sell_count = 0u32;
+
+                for trade in &trades {
+                    let quote_qty: f64 =
+                        trade["quoteQty"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
+                    let commission: f64 =
+                        trade["commission"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
+                    let commission_asset = trade["commissionAsset"].as_str().unwrap_or("");
+                    let is_buyer = trade["isBuyer"].as_bool().unwrap_or(false);
+                    if is_buyer {
+                        total_bought += quote_qty;
+                        buy_count += 1;
+                    } else {
+                        total_sold += quote_qty;
+                        sell_count += 1;
+                    }
+                    if matches!(commission_asset, "USDT" | "USDC" | "BUSD") {
+                        total_commission += commission;
+                    }
+                }
+
+                let total_volume = total_bought + total_sold;
+                let net_pnl = total_sold - total_bought - total_commission;
+                println!("Total volume:    ${:.2}", total_volume);
+                println!("Total bought:    ${:.2}  ({} buys)", total_bought, buy_count);
+                println!("Total sold:      ${:.2}  ({} sells)", total_sold, sell_count);
+                println!("Commission paid: ${:.2}", total_commission);
+                println!("Net PnL:         ${:+.2}", net_pnl);
+            }
+
+            println!("\nAPI credentials are working! Run without --test to generate proof.");
         }
-        
-        println!("Total bought: ${:.2}", total_bought);
-        println!("Total sold: ${:.2}", total_sold);
-        println!("Net PnL: ${:+.2}", total_sold - total_bought);
+
+        Endpoint::Account => {
+            let query = format!(
+                "timestamp={}&recvWindow={}",
+                timestamp, BINANCE_RECV_WINDOW_MS
+            );
+            let signature = sign_request(&query, secret_key);
+            let url = format!(
+                "https://{}/api/v3/account?{}&signature={}",
+                BINANCE_HOST, query, signature
+            );
+
+            info!("Fetching account snapshot from Binance...");
+
+            let response = client
+                .get(&url)
+                .header("X-MBX-APIKEY", api_key)
+                .send()
+                .await?;
+            let status = response.status();
+            let body = response.text().await?;
+
+            if !status.is_success() {
+                anyhow::bail!("Binance API error: {} - {}", status, body);
+            }
+
+            let account: serde_json::Value = serde_json::from_str(&body)?;
+
+            println!("\n=== Binance API Test Successful (account) ===");
+            if let Some(balances) = account["balances"].as_array() {
+                let non_zero: Vec<_> = balances
+                    .iter()
+                    .filter(|b| {
+                        let free: f64 = b["free"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
+                        let locked: f64 =
+                            b["locked"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
+                        free + locked > 0.0
+                    })
+                    .collect();
+                println!("Non-zero balances ({}):", non_zero.len());
+                for b in &non_zero {
+                    let asset = b["asset"].as_str().unwrap_or("?");
+                    let free: f64 = b["free"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
+                    let locked: f64 = b["locked"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
+                    println!("  {}: free={:.8}  locked={:.8}", asset, free, locked);
+                }
+            }
+
+            println!("\nAPI credentials are working! Run without --test to generate proof.");
+        }
     }
-    
-    println!("\nAPI credentials are working! Run without --test to generate proof.");
-    
+
     Ok(())
 }
 
@@ -280,20 +411,41 @@ async fn run_prover<S: AsyncWrite + AsyncRead + Send + Sync + Unpin + 'static>(
     socket: S,
     api_key: &str,
     secret_key: &str,
+    endpoint: &Endpoint,
     symbol: &str,
     limit: u32,
+    start_ms: Option<u64>,
+    end_ms: Option<u64>,
 ) -> Result<(Attestation, Secrets)> {
-    // Build the request parameters
+    // Build the request URI for the chosen endpoint
     let timestamp = get_binance_server_timestamp()
         .await
         .unwrap_or_else(|_| get_timestamp());
-    let query_without_sig = format!(
-        "symbol={}&timestamp={}&recvWindow={}&limit={}",
-        symbol, timestamp, BINANCE_RECV_WINDOW_MS, limit
-    );
-    let signature = sign_request(&query_without_sig, secret_key);
-    let full_query = format!("{}&signature={}", query_without_sig, signature);
-    let uri = format!("/api/v3/myTrades?{}", full_query);
+
+    let uri = match endpoint {
+        Endpoint::Trades => {
+            let mut query = format!(
+                "symbol={}&timestamp={}&recvWindow={}&limit={}",
+                symbol, timestamp, BINANCE_RECV_WINDOW_MS, limit
+            );
+            if let Some(start) = start_ms {
+                query.push_str(&format!("&startTime={}", start));
+            }
+            if let Some(end) = end_ms {
+                query.push_str(&format!("&endTime={}", end));
+            }
+            let signature = sign_request(&query, secret_key);
+            format!("/api/v3/myTrades?{}&signature={}", query, signature)
+        }
+        Endpoint::Account => {
+            let query = format!(
+                "timestamp={}&recvWindow={}",
+                timestamp, BINANCE_RECV_WINDOW_MS
+            );
+            let signature = sign_request(&query, secret_key);
+            format!("/api/v3/account?{}&signature={}", query, signature)
+        }
+    };
 
     info!("Connecting to notary...");
 
@@ -383,35 +535,68 @@ async fn run_prover<S: AsyncWrite + AsyncRead + Send + Sync + Unpin + 'static>(
     let body = response.collect().await?.to_bytes();
     let body_str = String::from_utf8_lossy(&body);
     
-    // Parse and display trade summary
-    if let Ok(trades) = serde_json::from_str::<Vec<serde_json::Value>>(&body_str) {
-        info!("Received {} trades", trades.len());
-        
-        // Calculate PnL summary
-        let mut total_bought: f64 = 0.0;
-        let mut total_sold: f64 = 0.0;
-        
-        for trade in &trades {
-            let quote_qty: f64 = trade["quoteQty"]
-                .as_str()
-                .unwrap_or("0")
-                .parse()
-                .unwrap_or(0.0);
-            let is_buyer = trade["isBuyer"].as_bool().unwrap_or(false);
-            
-            if is_buyer {
-                total_bought += quote_qty;
-            } else {
-                total_sold += quote_qty;
+    // Parse and display a summary of the notarised data
+    match endpoint {
+        Endpoint::Trades => {
+            if let Ok(trades) = serde_json::from_str::<Vec<serde_json::Value>>(&body_str) {
+                info!("Received {} trades", trades.len());
+
+                let mut total_bought: f64 = 0.0;
+                let mut total_sold: f64 = 0.0;
+                let mut buy_count = 0u32;
+                let mut sell_count = 0u32;
+
+                for trade in &trades {
+                    let quote_qty: f64 = trade["quoteQty"]
+                        .as_str()
+                        .unwrap_or("0")
+                        .parse()
+                        .unwrap_or(0.0);
+                    let is_buyer = trade["isBuyer"].as_bool().unwrap_or(false);
+
+                    if is_buyer {
+                        total_bought += quote_qty;
+                        buy_count += 1;
+                    } else {
+                        total_sold += quote_qty;
+                        sell_count += 1;
+                    }
+                }
+
+                let net_pnl = total_sold - total_bought;
+                println!("\n--- Trade Summary for {} ---", symbol);
+                println!("Total trades:  {} ({} buys, {} sells)", trades.len(), buy_count, sell_count);
+                println!("Total volume:  ${:.2}", total_bought + total_sold);
+                println!("Total bought:  ${:.2}", total_bought);
+                println!("Total sold:    ${:.2}", total_sold);
+                println!("Net PnL:       ${:+.2}", net_pnl);
             }
         }
-        
-        let net_pnl = total_sold - total_bought;
-        println!("\n--- Trade Summary for {} ---", symbol);
-        println!("Total trades: {}", trades.len());
-        println!("Total bought: ${:.2}", total_bought);
-        println!("Total sold:   ${:.2}", total_sold);
-        println!("Net PnL:      ${:+.2}", net_pnl);
+        Endpoint::Account => {
+            if let Ok(account) = serde_json::from_str::<serde_json::Value>(&body_str) {
+                if let Some(balances) = account["balances"].as_array() {
+                    let non_zero: Vec<_> = balances
+                        .iter()
+                        .filter(|b| {
+                            let free: f64 =
+                                b["free"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
+                            let locked: f64 =
+                                b["locked"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
+                            free + locked > 0.0
+                        })
+                        .collect();
+                    println!("\n--- Account Snapshot ---");
+                    println!("Non-zero balances: {}", non_zero.len());
+                    for b in &non_zero {
+                        let asset = b["asset"].as_str().unwrap_or("?");
+                        let free: f64 = b["free"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
+                        let locked: f64 =
+                            b["locked"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
+                        println!("  {}: free={:.8}  locked={:.8}", asset, free, locked);
+                    }
+                }
+            }
+        }
     }
 
     // Wait for prover to complete

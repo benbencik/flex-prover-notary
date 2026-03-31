@@ -101,7 +101,7 @@ This creates:
 cargo run -p binance-pnl-verifier -- presentation.tlsn
 ```
 
-Expected output:
+Expected output (trade proof):
 ```
 === TLSNotary Proof Verification ===
 
@@ -114,12 +114,28 @@ Notary public key: 04a1b2c3...
 ✓ Transcript: 512 bytes sent, 4096 bytes received
 ✓ Request: GET /api/v3/myTrades
 
+--- Verified Response Body ---
+Number of trades: 50
+
 --- Computed PnL (BTCUSDT) ---
 Total bought:     $  12,430.20
 Total sold:       $  12,862.70
-Commission paid:  $      12.50
+Commission (USDT):$       12.50
 ─────────────────────────────
 Net PnL:          $    +419.50 USDT ✓
+
+--- Trade Statistics ---
+Total trades:         50  (28 buys, 22 sells)
+Total volume:     $  25,292.90
+Avg buy size:     $     444.01
+Largest buy:      $   1,200.00
+Avg sell size:    $     584.67
+Largest sell:     $   2,100.00
+Maker / Taker:        30 /     20  (60.0% maker)
+
+Trade period:
+  From: 2024-01-01 00:00:00 UTC
+  To:   2024-01-15 14:32:01 UTC
 
 ✓ Verification complete!
 ```
@@ -180,11 +196,28 @@ cargo run -p binance-pnl-prover -- [OPTIONS]
 
 Options:
   -s, --symbol <SYMBOL>              Trading pair [default: BTCUSDT]
-  -l, --limit <LIMIT>                Number of trades [default: 100]
+  -l, --limit <LIMIT>                Number of trades [default: 10]
+      --start-time <YYYY-MM-DD>      Only include trades on/after this date (UTC)
+      --end-time   <YYYY-MM-DD>      Only include trades on/before this date (UTC)
+      --endpoint <ENDPOINT>          API endpoint to notarise: trades (default) | account
   -a, --attestation-output <FILE>    Output attestation [default: attestation.tlsn]
   -k, --secrets-output <FILE>        Output secrets [default: secrets.tlsn]
       --notary-host <HOST>           Notary host [default: 127.0.0.1]
       --notary-port <PORT>           Notary port [default: 7047]
+      --test                         Fetch from Binance without notarisation (sanity-check)
+```
+
+#### Examples
+
+```bash
+# Prove last 50 trades for ETHUSDT
+cargo run -p binance-pnl-prover -- --symbol ETHUSDT --limit 50
+
+# Prove trades within a specific date range
+cargo run -p binance-pnl-prover -- --symbol BTCUSDT --start-time 2024-01-01 --end-time 2024-03-31
+
+# Prove your account balance snapshot
+cargo run -p binance-pnl-prover -- --endpoint account
 ```
 
     ### Notary
@@ -220,6 +253,11 @@ Arguments:
 Options:
   -v, --verbose     Show raw transcript data
 ```
+
+The verifier auto-detects the response type (trade history or account snapshot) and displays:
+
+- **Trade history**: PnL, total volume, buy/sell counts, average/largest/smallest trade, maker/taker ratio, commission breakdown by asset, trade time range.
+- **Account snapshot**: non-zero asset balances (free + locked), commission rates, account permissions.
 
 ## Security Considerations
 
